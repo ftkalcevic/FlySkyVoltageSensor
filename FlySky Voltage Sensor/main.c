@@ -7,6 +7,7 @@
 
 #include <avr/io.h>
 #include <util/delay.h>
+#include <avr/cpufunc.h>
 
 #if defined(__AVR_ATmega328P__)
 
@@ -15,9 +16,42 @@
 #define LED_BUILTIN_PIN		PINB
 #define LED_BUILTIN			5
 
+#define UCSRA				UCSR0A
+#define UDRE				UDRE0
+#define UDR					UDR0
+#define UCSRB				UCSR0B
+#define TXEN				TXEN0
+#define RXEN				RXEN0
+#define TXC					RXC0
+#define RXC					TXC0
+#define UBRRL				UBRR0L
+#define U2X					U2X0
+#define WGM00				WGM10
+#define WGM01				WGM11
+#define WGM02				WGM12
+#define WGM03				WGM13
+#define ICF0				ICF1
+#define ICES0				ICES1
+#define ICR0				ICR1
 
-#elif defined(__AVR_ATTINY102__)
+#elif defined(__AVR_ATtiny102__)
 
+// Not a real LED, just an output for testing the clock
+#define LED_BUILTIN_DDR		DDRB
+#define LED_BUILTIN_PORT	PORTB
+#define LED_BUILTIN_PIN		PINB
+#define LED_BUILTIN			1
+
+// 8	GND
+// 7	RxD0		USART RX	
+// 6	TxD0/ICP0	USART TX		ICP0 for measuring timer pulses
+// 5	ADC5		ADC input
+// 
+
+// 4	Reset		TDI-Reset
+// 3	TPI_Data	
+// 2	TPI_Clk		
+// 1	Vcc
 #endif
 
 #define CMD_DISCOVER_SENSOR		0x80
@@ -36,6 +70,23 @@ enum EReceiveState
 	ESkipData
 };
 
+//static uint16_t checksum  __attribute(( section(".noinit") ));	// this is broken.
+static uint16_t checksum;
+static uint16_t adc_sum;
+static uint16_t last_voltage;
+static uint16_t last_input_capture;
+static uint8_t cmd;
+static uint8_t len;
+static uint8_t adc_count;
+static uint8_t overflowed;
+static uint8_t got_falling_edge;
+static enum EReceiveState receive_state;
+
+
+//void __do_clear_bss(void)		// don't init bss
+//{
+//}
+
 static void test_clock( void )
 {
 	#ifdef LED_BUILTIN
@@ -48,11 +99,46 @@ static void test_clock( void )
 	#endif
 }
 
+static void _SEND( uint8_t c)
+{
+	while ( !(UCSRA & _BV(UDRE)) )
+	continue;
+	UDR = c;
+}
+
 static void SEND( uint8_t c)
 {
-	while ( !(UCSR0A & _BV(UDRE0)) )
+	_SEND(c);
+	checksum -= c;
+}
+
+static void send_checksum(void)
+{
+	_SEND( *(((uint8_t *)&checksum)) );
+	_SEND( *(((uint8_t *)&checksum)+1) );
+}
+
+
+static void replay_delay(void)
+{
+	_delay_us(REPLY_DELAY);
+}
+
+
+static void switch_to_transmit(void)
+{
+	UCSRB = 0;
+	UCSRB = _BV(TXEN);
+	checksum = 0xFFFF;
+}
+
+static void switch_to_receive(void)
+{
+	while ( (UCSRA & _BV(TXC)) == 0 )
 		continue;
-	UDR0 = c;
+									
+	UCSRA |= _BV(RXC);
+	UCSRB = _BV(RXEN);
 }
 
 static void calibrate_clock(void)
@@ -70,87 +156,91 @@ static void calibrate_clock(void)
 	// timer measures at rising edge.
 }
 
-int main(void)
+void main(void)
 {
-     // set up clock
-	 //test_clock();
+     // set up clock - turn off div8 scale
+	 CCP = CCP_IOREG_gc;
+	 CLKPSR = 0;
+	 
+	 //test_clock(); 	 return;
 	 
 	 // calibrate clock
 	 calibrate_clock();
 	 
-	 // set up usart
-	 UBRR0L = 7;
-	 UCSR0A = _BV(U2X0);
-	 UCSR0B =  _BV(RXEN0); 
+	 // set up usart.  2 options, depending on the calibaration-ability of the internal oscillator.
+	 // BRR=7, F_CPU=7372800, 64 timer ticks per bit
+	 // BRR=8, F_CPU=8294400, 72 timer ticks per bit
+#define USART_TIME_TICKS		72
+	 UBRRL = 8;
+	 UCSRA = _BV(U2X);
+	 UCSRB =  _BV(RXEN); 
 	 //UCSR0C =
 	 //UCSR1D = 
+	 
 	 // set up adc
-	ADMUX = _BV(REFS0) | _BV(REFS1); // 1.1v reference.  ADC0 input
+	ADMUX = _BV(REFS0) | _BV(MUX2) | _BV(MUX0); // 2.2v reference.  ADC5 input
 	ADCSRA = _BV(ADSC) | _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0) | _BV(ADATE);	// enable, start, prescale 128
 	
 	// timer (atmega TC1 16bit attiny102 TC0 16bit)
 	// 8MHz, fast PWM (mode 15), TOP=OCR1A=0x1FFF ~ 2ms
-	OCR1A = 0x1FFF;
-	TCCR1A = _BV(WGM11) | _BV(WGM10);
-	TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10);	// Clock div 1 - 8MHz.  Overflow 8.192ms
+	OCR0A = 0x1FFF;
+	TCCR0A = _BV(WGM01) | _BV(WGM00);
+	TCCR0B = _BV(WGM03) | _BV(WGM02) | _BV(CS00);	// Clock div 1 - 8MHz.  Overflow 8.192ms
 
+DDRA |= _BV(0);
 	
-	 
-	enum EReceiveState receive_state;
-	int receiving = 1;
-	uint8_t cmd;
-	uint8_t len;
-	uint16_t checksum;
-	uint8_t adc_count = 0;
-	uint16_t adc_sum = 0;
-	uint16_t last_voltage = 0;
-	uint16_t last_input_capture = 0;
-	uint8_t overflowed = 0;
-	uint8_t got_falling_edge = 0;
+	receive_state = EIdle; 
     while (1) 
     {
-		if ( TIFR1 & _BV(TOV1) )
+		if ( TIFR0 & _BV(TOV0) )
 		{
 			// Overflow
-			TIFR1 |= _BV(TOV1) | _BV(ICF1);
-			TCCR1B &= ~_BV(ICES1);	// next trigger on falling edge
+			TIFR0 |= _BV(TOV0) | _BV(ICF0);
+			TCCR0B &= ~_BV(ICES0);	// next trigger on falling edge
 			receive_state = EIdle;
 			last_input_capture = 0;
 			overflowed = 1;
 			got_falling_edge = 0;
 		}
 		
-		if ( overflowed && (TIFR1 & _BV(ICF1)) )
+		if ( overflowed && (TIFR0 & _BV(ICF0)) )
 		{
-			uint16_t capture = ICR1;
-			TIFR1 |= _BV(ICF1);
+			register uint16_t capture = ICR0;
+			TIFR0 |= _BV(ICF0);
 			
 			{
 				if ( !got_falling_edge )
 				{
-					TCCR1B |= _BV(ICES1);	// next trigger on rising edge
+					TCCR0B |= _BV(ICES0);	// next trigger on rising edge
 					last_input_capture = capture;
 					got_falling_edge = 1;
 				}
 				else
 				{
 					// input capture
-					uint16_t diff = capture - last_input_capture;
+					register uint16_t diff = capture - last_input_capture;
 					
 					// Correct oscillator.  192 clicks gives 7.3728MHz, which is an even baud rate multiplier for 115.2kHz
 					// TODO The assumption here is the first bits are start-0-0-1.  192 assumes 64ticks per bit.  We could look for multiples
-					if ( diff > 192 )
+					if ( diff > 3*USART_TIME_TICKS )
 					{
 						if ( OSCCAL > 0 )
 							OSCCAL = OSCCAL - 1;
 					}
-					else if ( diff < 192 )
+					else if ( diff < 3*USART_TIME_TICKS )
 					{
 						if ( OSCCAL < 255 )
 							OSCCAL = OSCCAL + 1;
 					}
-					
+					// TODO - if we aren't adjusting anymore, we can power off the timers to save power.
 					overflowed = 0;
+
+#ifdef SHOW_10us_PULSE					
+					// Debug the OSCCAL auto calibration against the 115200 baud uart.
+					PINA |= _BV(0);
+					_delay_us(10);
+					PINA |= _BV(0);
+#endif
 				}
 			}
 		}
@@ -159,7 +249,9 @@ int main(void)
 		if ( ADCSRA & _BV(ADIF) )
 		{
 			// Divider is 39k / 4k7 -> 1023n = 10.23v
-			adc_sum += ADC;
+			register uint16_t sample = ADCL;
+			sample |= ADCH<<8;
+			adc_sum += sample;
 			adc_count++;
 			if (adc_count == 32)
 			{
@@ -169,133 +261,99 @@ int main(void)
 			}
 		}
 		
-		if ( UCSR0A & _BV(RXC0) )
+		if ( UCSRA & _BV(RXC) )
 		{
-			uint8_t c = UDR0;
+			register uint8_t c = UDR;
 			
-			if ( receiving )
+			switch ( receive_state )
 			{
-				switch ( receive_state )
-				{
-					case EIdle:
-						len = c;
-						if ( len == 4 )	// We only support 4 byte commands
-						{
-							checksum = 0xFFFF;
-							checksum -= c;
-							receive_state = EReadData;
-						}
-						else
-						{
-							receive_state = ESkipData;
-						}
+				case EIdle:
+					len = c;
+					if ( len == 4 )	// We only support 4 byte commands
+					{
+						checksum = 0xFFFF;
+						checksum -= c;
+						receive_state = EReadData;
+					}
+					else
+					{
+						receive_state = ESkipData;
+					}
+					len--;
+					break;
+						
+				case ESkipData:
+					len--;
+					if ( len == 0 )
+						receive_state = EIdle;
+					break;
+						
+				case EReadData:
+						
+					if ( len == 3 )
+					{
+						cmd = c;
+						checksum -= c;
 						len--;
-						break;
-						
-					case ESkipData:
+					}
+					else if ( len == 2 )
+					{
+						*((uint8_t *)&checksum) ^= c;
 						len--;
-						if ( len == 0 )
-							receive_state = EIdle;
-						break;
-						
-					case EReadData:
-						
-						if ( len == 3 )
-						{
-							cmd = c;
-							checksum -= c;
-							len--;
-						}
-						else if ( len == 2 )
-						{
-							*((uint8_t *)&checksum) ^= c;
-							len--;
-						}
-						else if ( len == 1 )
-						{
-							*(((uint8_t *)&checksum)+1) ^= c;
+					}
+					else if ( len == 1 )
+					{
+						*(((uint8_t *)&checksum)+1) ^= c;
 							
-							if ( checksum == 0 )
+						if ( checksum == 0 )
+						{
+							// process cmd
+							if ( cmd == (CMD_DISCOVER_SENSOR | ADDRESS_1 ) )
 							{
-								// process cmd
-								if ( cmd == (CMD_DISCOVER_SENSOR | ADDRESS_1 ) )
-								{
-									// reply
-									checksum = 0xFFFF;
-									UCSR0B = 0;
-									UCSR0B = _BV(TXEN0);
-// TODO these delays aren't right
-									_delay_us(REPLY_DELAY);
-									SEND(4);
-									checksum -= 4;
-									SEND(cmd);
-									checksum -= cmd;
-									SEND(checksum & 0xFF);
-									SEND(checksum >> 8);
-									while ( (UCSR0A & _BV(TXC0)) == 0 )
-										continue;
-									
-									UCSR0A |= _BV(RXC0);
-									UCSR0B = _BV(RXEN0);
-								}
-								else if ( cmd == (CMD_REQUEST_SENSOR_TYPE | ADDRESS_1 ) )
-								{
-									checksum = 0xFFFF;
-									
-									UCSR0B = 0;
-									_delay_us(REPLY_DELAY);
-									UCSR0B = _BV(TXEN0);
-									SEND(6);
-									checksum -= 6;
-									SEND(cmd);
-									checksum -= cmd;
-									SEND(SENSOR_TYPE_EXTERNAL_VOLATAGE);
-									checksum -= SENSOR_TYPE_EXTERNAL_VOLATAGE;
-									SEND(2);
-									checksum -= 2;
-									SEND(checksum & 0xFF);
-									SEND(checksum >> 8);
-									while ( (UCSR0A & _BV(TXC0)) == 0 )
-										continue;
+								// reply
+								switch_to_transmit();
 
-									UCSR0A |= _BV(RXC0);									
-									UCSR0B = _BV(RXEN0);
-								}
-								else if ( cmd == (CMD_REQUEST_MEASUREMENT | ADDRESS_1 ) )
-								{
-									uint16_t last_scaled_voltage = last_voltage;
-									checksum = 0xFFFF;
+								replay_delay();
+								SEND(4);
+								SEND(cmd);
+								send_checksum();
 									
-									UCSR0B = 0;
-									_delay_us(REPLY_DELAY);
-									UCSR0B = _BV(TXEN0);
-									SEND(6);
-									checksum -= 6;
-									SEND(cmd);
-									checksum -= cmd;
-									uint8_t t1 = last_voltage & 0xff;
-									SEND(t1);
-									checksum -= t1;
-									t1 = last_voltage >> 8;
-									SEND(t1);
-									checksum -= t1;
-									SEND(checksum & 0xFF);
-									SEND(checksum >> 8);
-									while ( (UCSR0A & _BV(TXC0)) == 0 )
-										continue;
-
-									UCSR0A |= _BV(RXC0);									
-									UCSR0B = _BV(RXEN0);
-								}
+								switch_to_receive();									
 							}
-							receive_state = EIdle;
+							else if ( cmd == (CMD_REQUEST_SENSOR_TYPE | ADDRESS_1 ) )
+							{
+								switch_to_transmit();
+									
+								replay_delay();
+								SEND(6);
+								SEND(cmd);
+								SEND(SENSOR_TYPE_EXTERNAL_VOLATAGE);
+								SEND(2);
+								send_checksum();
+									
+								switch_to_receive();
+							}
+							else if ( cmd == (CMD_REQUEST_MEASUREMENT | ADDRESS_1 ) )
+							{
+								switch_to_transmit();
+
+								replay_delay();
+								SEND(6);
+								SEND(cmd);
+								uint8_t t1 = last_voltage & 0xff;
+								SEND(t1);
+								t1 = last_voltage >> 8;
+								SEND(t1);
+								send_checksum();
+
+								switch_to_receive();
+							}
 						}
-						
-						break;
-				}
+						receive_state = EIdle;
+					}
+					break;
 			}
 		}
-
     }
 }
 
